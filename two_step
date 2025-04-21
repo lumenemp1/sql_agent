@@ -1,0 +1,206 @@
+# agent_vector_sql.py
+"""
+Run a LangChain SQL agent that first narrows the schema with FAISS
+and then lets SQLCoder generate / execute the query.
+"""
+
+# ---------------------------------------------------------------------
+# Imports
+# ---------------------------------------------------------------------
+import json, re, numpy as np, faiss
+from typing import Optional, List, Any, Set
+from sentence_transformers import SentenceTransformer
+from sqlalchemy import inspect, create_engine, text
+from llama_cpp import Llama
+
+from langchain_community.utilities import SQLDatabase
+from langchain_community.agent_toolkits.sql.base import create_sql_agent
+from langchain.agents.agent_types import AgentType
+from langchain_core.language_models.llms import LLM
+from pydantic import PrivateAttr
+
+# ---------------------------------------------------------------------
+# Paths / hyper‑params
+# ---------------------------------------------------------------------
+LLAMA_MODEL_PATH = "sqlcoder-7b-2.Q4_K_M.gguf"
+DB_URI           = "mysql+pymysql://root:admin@localhost/chatbot"
+
+INDEX_PATH       = "schema_index/faiss_index.bin"
+META_PATH        = "schema_index/table_metadata.json"
+EMBED_MODEL_NAME = "BAAI/bge-small-en"
+TOP_K            = 3                        # top‑K from semantic search
+
+N_CTX     = 4096
+N_THREADS = 8
+
+# ---------------------------------------------------------------------
+# ─── Vector‑search helpers (ported from your 2nd script) ──────────────
+# ---------------------------------------------------------------------
+def load_faiss_and_metadata(index_path: str, meta_path: str):
+    index = faiss.read_index(index_path)
+    with open(meta_path, "r") as f:
+        meta = json.load(f)
+    return index, meta
+
+_fk_regex = re.compile(r"REFERENCES\s+`?(\w+)`?", re.IGNORECASE)
+
+def build_reverse_fk_map(metadata: dict) -> dict[str, set[str]]:
+    rev = {m["table_name"]: set() for m in metadata.values()}
+    for m in metadata.values():
+        for ref in _fk_regex.findall(m["create_stmt"]):
+            if ref in rev:
+                rev[ref].add(m["table_name"])
+    return rev
+
+def parse_forward_fks(ddl: str) -> set[str]:
+    return set(_fk_regex.findall(ddl))
+
+def semantic_search(q: str, embed_model, index, k: int):
+    q_emb = np.array([embed_model.encode(q)], dtype="float32")
+    _d, I = index.search(q_emb, k)
+    return I[0]
+
+def expand_with_related(idxs, meta, rev_fk):
+    base = {meta[str(i)]["table_name"] for i in idxs}
+    extra: Set[str] = set()
+    for i in idxs:
+        tbl = meta[str(i)]["table_name"]
+        ddl = meta[str(i)]["create_stmt"]
+        extra |= parse_forward_fks(ddl)
+        extra |= rev_fk.get(tbl, set())
+    return base | extra
+
+# ---------------------------------------------------------------------
+# ─── Thin wrapper around llama‑cpp for LangChain ─────────────────────
+# ---------------------------------------------------------------------
+def load_llama(path: str):
+    print(f"🧠 Loading SQLCoder from {path}")
+    return Llama(
+        model_path=path,
+        n_gpu_layers=0, n_ctx=N_CTX, n_threads=N_THREADS,
+        n_batch=512, use_mlock=True, use_mmap=True, logits_all=False,
+        verbose=True,
+    )
+
+class SQLCoderLLM(LLM):
+    _model: Any = PrivateAttr()
+
+    def __init__(self, model): super().__init__(); self._model = model
+    @property
+    def _llm_type(self): return "sqlcoder‑llama"
+
+    def _call(self, prompt: str, stop: Optional[List[str]] = None) -> str:
+        out = self._model(prompt, max_tokens=512, stop=stop)
+        text = out["choices"][0]["text"]
+        # keep only the first statement
+        if "SELECT" in text and ";" in text:
+            text = text.split(";", 1)[0] + ";"
+        return text.strip()
+
+# ---------------------------------------------------------------------
+# ─── 1.  Build SQLCoder LLM + DB  (unchanged)  ───────────────────────
+# ---------------------------------------------------------------------
+print("🔧 Initialising FAISS / embedder / SQLCoder …")
+_faiss, _meta = load_faiss_and_metadata(INDEX_PATH, META_PATH)
+_rev_fk       = build_reverse_fk_map(_meta)
+_embed_model  = SentenceTransformer(EMBED_MODEL_NAME)
+_llama_raw    = load_llama(LLAMA_MODEL_PATH)
+llm           = SQLCoderLLM(_llama_raw)
+db            = SQLDatabase.from_uri(DB_URI)
+
+# ---------------------------------------------------------------------
+# ─── 2.  Custom FAISS‑backed schema tool  ────────────────────────────
+# ---------------------------------------------------------------------
+from langchain.tools import Tool   # ← generic tool wrapper
+
+def build_schema_snippet(table_names: set[str],metadata:dict) -> str:
+    ddl_list =[]
+    for meta in metadata.values():
+        if meta["table_name"] in table_names:
+            ddl_list.append(meta["create_stmt"])
+    return "\n\n".join(ddl_list)
+
+def _schema_from_vector(question: str) -> str:
+    """
+    ① embed the question  ② FAISS top‑K ③ FK expansion ④ build DDL snippet
+    """
+    idxs   = semantic_search(question, _embed_model, _faiss, TOP_K)
+    tables = expand_with_related(idxs, _meta, _rev_fk)
+    print(f"\n🧩 Tables selected for prompt: {sorted(tables)}\n")
+    return build_schema_snippet(tables, _meta)
+
+vector_schema_tool = Tool(
+    name="sql_db_schema",            # ⚠️ same name as the default → overrides it
+    func=_schema_from_vector,
+    description=(
+        "Given a natural‑language question, return ONLY the schema DDL for the "
+        "relevant tables as Markdown. Uses semantic search over table DDLs."
+    ),
+)
+
+# ---------------------------------------------------------------------
+# 3 bis.  Build a strict prompt so the agent *must* fetch schema first
+# ---------------------------------------------------------------------
+PREFIX = """You are an expert SQL analyst.
+**Always start by calling the tool `sql_db_schema`** with the user question
+as its input.  Only after you have examined the returned CREATE TABLE
+statements should you think about which columns to query.
+Follow this tool‑calling format exactly:
+
+Thought: you must think about what to do
+Action: the_tool_name
+Action Input: the input for the tool
+Observation: the result of the tool
+(Repeat Thought/Action/Observation as needed)
+Thought: I now know the final answer
+Final Answer: the result for the user
+"""
+
+SUFFIX = """Begin!  Remember: start with `sql_db_schema`."""
+
+
+# ---------------------------------------------------------------------
+# 4.  Collect tools (same as before) & build the agent
+# ---------------------------------------------------------------------
+from langchain_community.agent_toolkits.sql.base import SQLDatabaseToolkit
+
+std_db_tools = SQLDatabaseToolkit(db=db, llm=llm).get_tools()
+std_db_tools = [t for t in std_db_tools if t.name != "sql_db_schema"]  # drop default
+tools = [vector_schema_tool, *std_db_tools]
+
+from langchain.agents import initialize_agent, AgentType
+
+agent = initialize_agent(
+    tools=tools,
+    llm=llm,
+    agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+    verbose=True,
+    return_intermediate_steps=True,
+    handle_parsing_errors=True,
+    agent_kwargs={"prefix": PREFIX, "suffix": SUFFIX},
+)
+
+
+# ---------------------------------------------------------------------
+# 5.  Interactive loop   (switch to .invoke() to silence the warning)
+# ---------------------------------------------------------------------
+print("\n✨ Ready!  Ask me anything about your database.\n")
+while True:
+    try:
+        question = input("❓> ").strip()
+        if not question:
+            continue
+        if question.lower() in {"exit", "quit"}:
+            break
+
+        result = agent.invoke({"input": question})   # ← no deprecation warning
+
+        # Debug trace
+        for act, obs in result["intermediate_steps"]:
+            print(f"• {act.tool}: {act.tool_input}")
+
+        print("\n✅ Final answer:")
+        print(result["output"])
+
+    except KeyboardInterrupt:
+        break
